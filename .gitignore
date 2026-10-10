@@ -1,0 +1,9 @@
+/node_modules
+/.next
+/out
+/public/wasm
+/next-env.d.ts
+*.tsbuildinfo
+/.core
+
+/public/shaders/section.wgsl

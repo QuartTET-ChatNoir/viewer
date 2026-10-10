@@ -1,0 +1,72 @@
+name: WebGPU viewer
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    env:
+      NEXT_PUBLIC_BASE_PATH: /viewer
+      QUARTTET_CORE_PATH: .core
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - id: core
+        run: echo "revision=$(cat core-revision.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: QuartTET-ChatNoir/core
+          ref: ${{ steps.core.outputs.revision }}
+          path: .core
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "*"
+          check-latest: true
+          cache: npm
+      - run: rustup update stable
+      - run: rustup target add wasm32-unknown-unknown
+      - run: npm install --global npm@latest
+      - run: npm ci
+      - run: npm run wasm
+      - run: npm run typecheck
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: npm run test:gpu
+        env:
+          WEBGPU_BACKEND: vulkan
+      - id: pages
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/configure-pages@v6.0.0
+      - name: Set Pages base path
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: echo "NEXT_PUBLIC_BASE_PATH=$PAGES_BASE_PATH" >> "$GITHUB_ENV"
+      - run: npm run build
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: quarttet-viewer-static
+          path: out
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: out
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5.0.1

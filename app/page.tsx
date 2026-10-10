@@ -1,0 +1,506 @@
+"use client";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Renderer, type Scene, type Stats } from "../src/gpu";
+import { loadCore, type Model } from "../src/model";
+const INITIAL: Scene = {
+  axis: 3,
+  offset: 0,
+  angles: [0, 0, 0, 0, 0, 0],
+  yaw: 0.55,
+  pitch: -0.32,
+  distance: 2.8,
+  style: 1,
+};
+const AXES = ["X", "Y", "Z", "W"];
+const PLANES = ["XY", "XZ", "XW", "YZ", "YW", "ZW"];
+function download(bytes: Uint8Array, name: string) {
+  const url = URL.createObjectURL(
+    new Blob([bytes.slice().buffer], { type: "application/octet-stream" }),
+  );
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+export default function Page() {
+  const canvas = useRef<HTMLCanvasElement>(null),
+    renderer = useRef<Renderer | null>(null),
+    model = useRef<Model | null>(null),
+    input = useRef<HTMLInputElement>(null);
+  const sceneRef = useRef<Scene>(INITIAL),
+    radiusRef = useRef(1),
+    frame = useRef(0),
+    pendingCompute = useRef(false);
+  const [scene, setScene] = useState<Scene>(INITIAL),
+    [ready, setReady] = useState(false),
+    [error, setError] = useState(""),
+    [name, setName] = useState("Tesseract / 超立方体"),
+    [counts, setCounts] = useState([0, 0]),
+    [radius, setRadius] = useState(1),
+    [stats, setStats] = useState<Stats>({
+      triangles: 0,
+      coplanar: 0,
+      milliseconds: 0,
+    }),
+    [oneBased, setOneBased] = useState(false),
+    [playing, setPlaying] = useState(false),
+    [busy, setBusy] = useState(false);
+  const change = useCallback((patch: Partial<Scene>, compute = true) => {
+    const next = { ...sceneRef.current, ...patch };
+    sceneRef.current = next;
+    setScene(next);
+    pendingCompute.current ||= compute;
+    cancelAnimationFrame(frame.current);
+    frame.current = requestAnimationFrame(() => {
+      renderer.current?.draw(next, pendingCompute.current);
+      pendingCompute.current = false;
+    });
+  }, []);
+  const install = useCallback(
+    (next: Model, title: string) => {
+      try {
+        renderer.current!.load({
+          positions: next.positions(),
+          indices: next.gpu_cells(),
+          center: next.center(),
+          radius: next.radius(),
+        });
+      } catch (e) {
+        next.free();
+        throw e;
+      }
+      model.current?.free();
+      model.current = next;
+      const r = Math.max(next.radius(), 1e-30);
+      radiusRef.current = r;
+      setRadius(r);
+      setName(title);
+      setCounts([next.vertex_count(), next.cell_count()]);
+      setStats({ triangles: 0, coplanar: 0, milliseconds: 0 });
+      setError("");
+      change({ ...INITIAL, angles: [...INITIAL.angles] });
+    },
+    [change],
+  );
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      let gpu: Renderer | undefined;
+      try {
+        const core = await loadCore();
+        if (cancelled) return;
+        gpu = await Renderer.create(canvas.current!);
+        if (cancelled) {
+          gpu.destroy();
+          return;
+        }
+        renderer.current = gpu;
+        gpu.onStats = setStats;
+        gpu.onError = setError;
+        install(core.ViewerModel.sample(0), "Tesseract / 超立方体");
+        setReady(true);
+      } catch (e) {
+        gpu?.destroy();
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame.current);
+      renderer.current?.destroy();
+      renderer.current = null;
+      model.current?.free();
+      model.current = null;
+    };
+  }, [install]);
+  useEffect(() => {
+    if (!playing) return;
+    let id = 0,
+      previous = 0;
+    const tick = (now: number) => {
+      if (previous) {
+        const r = radiusRef.current;
+        let offset = sceneRef.current.offset + (now - previous) * 0.00025 * r;
+        if (offset > r) offset = -r;
+        change({ offset });
+      }
+      previous = now;
+      id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(id);
+  }, [playing, change]);
+  async function sample(kind: number) {
+    setPlaying(false);
+    try {
+      const core = await loadCore();
+      install(
+        core.ViewerModel.sample(kind),
+        ["Tesseract / 超立方体", "16-cell / 正十六胞体", "5-cell / 正五胞体"][
+          kind
+        ],
+      );
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+  async function readFile(file: File) {
+    if (!ready) return;
+    setBusy(true);
+    setPlaying(false);
+    try {
+      if (file.size > 64 * 1024 * 1024)
+        throw new Error("ファイル上限は 64 MiB です。");
+      const core = await loadCore();
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      install(new core.ViewerModel(bytes, oneBased), file.name);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const drag = useRef<{ x: number; y: number; pointer: number } | null>(null);
+  return (
+    <main>
+      <header>
+        <div className="brand">
+          <span className="mark">Q</span>
+          <div>
+            <h1>
+              QuartTET <span>ChatNoir</span>
+            </h1>
+            <p>FOUR DIMENSIONS. ONE SECTION.</p>
+          </div>
+        </div>
+        <div className="engine">
+          <i className={ready ? "active" : ""} />
+          {ready ? "WebGPU compute" : "Initializing"}
+        </div>
+      </header>
+      <div className="workspace">
+        <aside>
+          <section>
+            <div className="section-title">
+              <span>01</span>
+              <h2>モデル</h2>
+            </div>
+            <button
+              className="open"
+              disabled={!ready || busy}
+              onClick={() => input.current?.click()}
+            >
+              {busy ? "読み込み中…" : "TE4 ファイルを開く"}
+              <span>↗</span>
+            </button>
+            <input
+              ref={input}
+              type="file"
+              accept=".te4"
+              hidden
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void readFile(file);
+                e.target.value = "";
+              }}
+            />
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={oneBased}
+                onChange={(e) => setOneBased(e.target.checked)}
+              />
+              頂点番号が 1 始まりのファイル
+            </label>
+            <div className="samples">
+              {["超立方体", "正十六胞体", "正五胞体"].map((s, i) => (
+                <button
+                  key={s}
+                  disabled={!ready || busy}
+                  onClick={() => void sample(i)}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            <p className="note">
+              type 1 · little-endian · 法線なし
+              <br />
+              ファイルはブラウザ内で処理されます。
+            </p>
+          </section>
+          <section>
+            <div className="section-title">
+              <span>02</span>
+              <h2>断面</h2>
+            </div>
+            <div className="segmented" aria-label="切断軸">
+              {AXES.map((a, i) => (
+                <button
+                  key={a}
+                  aria-pressed={scene.axis === i}
+                  disabled={!ready}
+                  onClick={() => {
+                    setPlaying(false);
+                    change({ axis: i, offset: 0 });
+                  }}
+                >
+                  {a}
+                </button>
+              ))}
+            </div>
+            <div className="label-row">
+              <label htmlFor="offset">{AXES[scene.axis]} =</label>
+              <input
+                id="offset"
+                type="number"
+                step={radius / 100}
+                min={-radius}
+                max={radius}
+                value={Number(scene.offset.toPrecision(6))}
+                disabled={!ready}
+                onChange={(e) => {
+                  const v = e.target.valueAsNumber;
+                  if (Number.isFinite(v))
+                    change({ offset: Math.max(-radius, Math.min(radius, v)) });
+                }}
+              />
+            </div>
+            <input
+              aria-label="断面の位置"
+              type="range"
+              min={-1}
+              max={1}
+              step={0.001}
+              value={scene.offset / radius}
+              disabled={!ready}
+              onChange={(e) =>
+                change({ offset: Number(e.target.value) * radius })
+              }
+            />
+            <div className="range-labels">
+              <span>−R</span>
+              <span>中心</span>
+              <span>+R</span>
+            </div>
+            <button
+              className="play"
+              disabled={!ready}
+              aria-pressed={playing}
+              onClick={() => setPlaying(!playing)}
+            >
+              {playing ? "Ⅱ  停止" : "▷  断面を再生"}
+            </button>
+            <p className="note">
+              モデル中心を原点とする座標です。
+              <br />R はモデルの外接半径。
+            </p>
+          </section>
+          <section>
+            <div className="section-title">
+              <span>03</span>
+              <h2>4次元回転</h2>
+              <button
+                className="text-button"
+                disabled={!ready}
+                onClick={() => change({ angles: [0, 0, 0, 0, 0, 0] })}
+              >
+                リセット
+              </button>
+            </div>
+            {PLANES.map((p, i) => (
+              <label className="rotation" key={p}>
+                <span>{p}</span>
+                <input
+                  type="range"
+                  min={-180}
+                  max={180}
+                  step={1}
+                  value={Math.round((scene.angles[i] * 180) / Math.PI)}
+                  disabled={!ready}
+                  onChange={(e) => {
+                    const angles = [...scene.angles];
+                    angles[i] = (Number(e.target.value) * Math.PI) / 180;
+                    change({ angles });
+                  }}
+                />
+                <output>
+                  {Math.round((scene.angles[i] * 180) / Math.PI)}°
+                </output>
+              </label>
+            ))}
+          </section>
+          <section>
+            <div className="section-title">
+              <span>04</span>
+              <h2>表示</h2>
+            </div>
+            <div className="segmented">
+              {["面", "面＋辺", "辺"].map((s, i) => (
+                <button
+                  key={s}
+                  disabled={!ready}
+                  aria-pressed={scene.style === i}
+                  onClick={() => change({ style: i }, false)}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            <div className="actions">
+              <button
+                disabled={!ready}
+                onClick={() =>
+                  change(
+                    {
+                      yaw: INITIAL.yaw,
+                      pitch: INITIAL.pitch,
+                      distance: INITIAL.distance,
+                    },
+                    false,
+                  )
+                }
+              >
+                カメラを戻す
+              </button>
+              <button
+                disabled={!ready}
+                onClick={() => {
+                  if (model.current)
+                    download(model.current.export_te4(), "model.te4");
+                }}
+              >
+                TE4 保存
+              </button>
+            </div>
+          </section>
+        </aside>
+        <div
+          className="viewport"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            const file = e.dataTransfer.files[0];
+            if (file) void readFile(file);
+          }}
+        >
+          <div className="view-top">
+            <div>
+              <span className="eyebrow">HYPERPLANE SECTION</span>
+              <h2>{name}</h2>
+            </div>
+            <span className="axis-badge">
+              {AXES[scene.axis]}
+              <small>定値断面</small>
+            </span>
+          </div>
+          <canvas
+            ref={canvas}
+            aria-label="4次元モデルの3次元断面"
+            onPointerDown={(e) => {
+              drag.current = {
+                x: e.clientX,
+                y: e.clientY,
+                pointer: e.pointerId,
+              };
+              e.currentTarget.setPointerCapture(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              const d = drag.current;
+              if (!d || d.pointer !== e.pointerId) return;
+              change(
+                {
+                  yaw: sceneRef.current.yaw + (e.clientX - d.x) * 0.007,
+                  pitch: Math.max(
+                    -1.5,
+                    Math.min(
+                      1.5,
+                      sceneRef.current.pitch + (e.clientY - d.y) * 0.007,
+                    ),
+                  ),
+                },
+                false,
+              );
+              drag.current = {
+                x: e.clientX,
+                y: e.clientY,
+                pointer: e.pointerId,
+              };
+            }}
+            onPointerUp={() => {
+              drag.current = null;
+            }}
+            onPointerCancel={() => {
+              drag.current = null;
+            }}
+            onWheel={(e) =>
+              change(
+                {
+                  distance: Math.max(
+                    1.2,
+                    Math.min(
+                      7,
+                      sceneRef.current.distance * Math.exp(e.deltaY * 0.001),
+                    ),
+                  ),
+                },
+                false,
+              )
+            }
+          />
+          {!ready && !error && (
+            <div className="center-message">
+              Rust / WASM と WebGPU を準備中…
+            </div>
+          )}
+          {ready && stats.triangles === 0 && (
+            <div className="center-message">
+              この位置には面の断面がありません
+            </div>
+          )}
+          {error && (
+            <div className="error" role="alert">
+              {error}
+              <button onClick={() => setError("")} aria-label="エラーを閉じる">
+                ×
+              </button>
+            </div>
+          )}
+          {stats.coplanar > 0 && (
+            <div className="warning">
+              {stats.coplanar.toLocaleString()}{" "}
+              胞が切断面と一致しています。体積を持つため面として出力していません。断面を少し移動してください。
+            </div>
+          )}
+          <div className="view-bottom">
+            <span>ドラッグで回転 · ホイールでズーム · ファイルをドロップ</span>
+            <button
+              disabled={!ready}
+              onClick={() => {
+                setPlaying(false);
+                change({ ...INITIAL, angles: [...INITIAL.angles] });
+              }}
+            >
+              全てリセット
+            </button>
+          </div>
+        </div>
+      </div>
+      <footer>
+        <div>
+          <span className="stat">
+            <b>{counts[0].toLocaleString()}</b> vertices
+          </span>
+          <span className="stat">
+            <b>{counts[1].toLocaleString()}</b> tetrahedra
+          </span>
+          <span className="stat">
+            <b>{stats.triangles.toLocaleString()}</b> triangles
+          </span>
+        </div>
+        <span className="pipeline">GPU SECTION → INDIRECT DRAW</span>
+      </footer>
+    </main>
+  );
+}
