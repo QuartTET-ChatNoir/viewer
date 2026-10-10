@@ -208,6 +208,7 @@ export class Renderer {
         }
         const positions = upload(new Float32Array(points));
         const indices = upload(packed);
+        const originalIds = upload(new Uint32Array(ids.keys()));
         const vertexNormals = upload(hasVertexNormals ? new Float32Array(normals) : new Float32Array(4));
         const cellNormals = upload(hasCellNormals
           ? mesh.cellNormals!.subarray(start * 4, (start + size) * 4) : new Float32Array(4));
@@ -219,7 +220,7 @@ export class Renderer {
         buffers.push(params, counters);
         const computeGroup = this.device.createBindGroup({
           layout: this.compute.getBindGroupLayout(0),
-          entries: [positions, indices, output, counters, params, vertexNormals, cellNormals].map(
+          entries: [positions, indices, output, counters, params, vertexNormals, cellNormals, originalIds].map(
             (buffer, binding) => ({ binding, resource: { buffer } })),
         });
         batches.push({ flags, count: size, params, counters, computeGroup });

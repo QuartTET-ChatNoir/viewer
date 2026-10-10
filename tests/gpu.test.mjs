@@ -119,6 +119,7 @@ async function run(model, axis, offset, angles) {
         uniform,
         input(vertexNormals.length ? vertexNormals : new Float32Array(4)),
         input(cellNormals.length ? cellNormals : new Float32Array(4)),
+        input(Uint32Array.from({length: positions.length / 4}, (_,i) => i)),
       ].map((b, binding) => ({ binding, resource: { buffer: b } })),
     });
     const read = buffer(
@@ -407,11 +408,11 @@ function te4WithNormals(kind, vertexNormals, cellNormals) {
   [kind,4,1].forEach((v,i) => view.setUint32(i*4,v,true));
   let at = 12;
   for (const p of positions) for (const value of p) { view.setFloat32(at,value,true); at+=4; }
-  for (const value of [0,1,2,3]) { view.setUint32(at,value,true); at+=4; }
+  for (const value of [1,2,3,4]) { view.setUint32(at,value,true); at+=4; }
   if (kind === 2 || kind === 4) for (const normal of vertexNormals)
     for (const value of normal) { view.setFloat32(at,value,true); at+=4; }
   if (kind === 3 || kind === 4) for (const value of cellNormals) { view.setFloat32(at,value,true); at+=4; }
-  return { model: new ViewerModel(bytes,false), positions };
+  return { model: new ViewerModel(bytes,true), positions };
 }
 function unit(v) {
   const length = Math.hypot(...v);
@@ -461,5 +462,49 @@ test("zero or plane-parallel projected normals fall back to finite geometric nor
         assert.ok(Math.abs(Math.hypot(...result.vertices.slice(at+4,at+7))-1)<1e-6);
       }
     } finally { model.free(); }
+  }
+});
+
+function quadModel(shear, order) {
+  const bytes = new Uint8Array(12+64+16), view = new DataView(bytes.buffer);
+  [1,4,1].forEach((v,i)=>view.setUint32(i*4,v,true));
+  const points=[[-2,0,0,-1],[2,0,0,-1],[shear,-2,0,1],[-shear,2,0,1]];
+  let at=12;
+  for (const p of points) for (const x of p) {view.setFloat32(at,x,true);at+=4;}
+  for (const i of order) {view.setUint32(at,i+1,true);at+=4;}
+  return new ViewerModel(bytes,true);
+}
+function triangleDiagonal(data,stride) {
+  const edges=new Map();
+  for(let at=0;at<data.length;at+=stride*3) {
+    const points=[0,1,2].map(i=>[0,1,2].map(j=>Math.round(data[at+i*stride+j]*1e5)));
+    for(let i=0;i<3;i++) {
+      const key=[points[i],points[(i+1)%3]].sort((a,b)=>{
+        for(let j=0;j<3;j++) if(a[j]!==b[j])return a[j]-b[j];return 0;
+      }).flat().join(",");
+      edges.set(key,(edges.get(key)??0)+1);
+    }
+  }
+  return [...edges].find(([,count])=>count===2)?.[0];
+}
+test("GPU quad uses Delaunay and a stable square diagonal across every cell ordering",async()=>{
+  const orders=[];
+  for(let a=0;a<4;a++)for(let b=0;b<4;b++)for(let c=0;c<4;c++)for(let d=0;d<4;d++) {
+    const order=[a,b,c,d]; if(new Set(order).size===4)orders.push(order);
+  }
+  for(const shear of [0,1])for(const angles of [[0,0,0,0,0,0],[0.37,0.2,0,0.4,0,0]]) {
+    let reference;
+    for(const order of orders) {
+      const model=quadModel(shear,order);
+      try {
+        const cpu=model.slice(3,0,new Float64Array(angles));
+        const result=await run(model,3,0,angles);
+        assert.equal(result.values[0],6);
+        const diagonal=triangleDiagonal(result.vertices,8);
+        assert.equal(diagonal,triangleDiagonal(cpu,6));
+        reference??=diagonal;
+        assert.equal(diagonal,reference);
+      }finally{model.free();}
+    }
   }
 });

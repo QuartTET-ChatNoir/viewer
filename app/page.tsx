@@ -35,7 +35,7 @@ export default function Page() {
       coplanar: 0,
       milliseconds: 0,
     }),
-    [oneBased, setOneBased] = useState(false),
+    [oneBased, setOneBased] = useState(true),
     [playing, setPlaying] = useState(false),
     [duration, setDuration] = useState(30),
     [busy, setBusy] = useState(false);
@@ -208,10 +208,10 @@ export default function Page() {
             <label className="check">
               <input
                 type="checkbox"
-                checked={oneBased}
-                onChange={(e) => setOneBased(e.target.checked)}
+                checked={!oneBased}
+                onChange={(e) => setOneBased(!e.target.checked)}
               />
-              頂点番号が 1 始まりのファイル
+              互換用：頂点番号が 0 始まりのファイル
             </label>
             <div className="samples">
               {["超立方体", "正十六胞体", "正五胞体"].map((s, i) => (
