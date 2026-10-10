@@ -10,7 +10,7 @@
     "test:gpu": "node --test tests/gpu.test.mjs"
   },
   "dependencies": {
-    "next": "16.3.8",
+    "next": "16.4.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
@@ -24,7 +24,7 @@
     "webgpu": "0.6.2"
   },
   "engines": {
-    "node": ">=26.10.0",
+    "node": ">=26.11.1",
     "npm": ">=12.2.0"
   },
   "packageManager": "npm@12.2.0"

@@ -1,6 +1,8 @@
 export type GpuMesh = {
   positions: Float32Array;
   indices: Uint32Array;
+  vertexNormals?: Float32Array;
+  cellNormals?: Float32Array;
   center: Float64Array;
   radius: number;
 };
@@ -12,6 +14,7 @@ export type Scene = {
   pitch: number;
   distance: number;
   style: number;
+  smooth: boolean;
 };
 export type Stats = {
   triangles: number;
@@ -44,47 +47,38 @@ export function rotation4(angles: number[]): Float32Array {
 }
 export class Renderer {
   private meshBuffers: GPUBuffer[] = [];
-  private computeGroup?: GPUBindGroup;
+  private batches: { flags: number; count: number; params: GPUBuffer; counters: GPUBuffer; computeGroup: GPUBindGroup }[] = [];
   private renderGroup?: GPUBindGroup;
   private depth?: GPUTexture;
-  private cells = 0;
   private center = new Float32Array(4);
   private radius = 1;
   private readback: GPUBuffer;
   private reading = false;
   private destroyed = false;
   private generation = 0;
-  private params: GPUBuffer;
   private camera: GPUBuffer;
-  private counters: GPUBuffer;
   private observer: ResizeObserver;
   private scene?: Scene;
-  private computeDirty = false;
   private needStats = false;
   onStats?: (stats: Stats) => void;
   onError?: (error: string) => void;
+  private canvas: HTMLCanvasElement;
+  private device: GPUDevice;
+  private context: GPUCanvasContext;
+  private compute: GPUComputePipeline;
+  private render: GPURenderPipeline;
   private constructor(
-    private canvas: HTMLCanvasElement,
-    private device: GPUDevice,
-    private context: GPUCanvasContext,
-    private compute: GPUComputePipeline,
-    private render: GPURenderPipeline,
+    canvas: HTMLCanvasElement, device: GPUDevice, context: GPUCanvasContext,
+    compute: GPUComputePipeline, render: GPURenderPipeline,
   ) {
-    this.params = device.createBuffer({
-      size: 112,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    this.canvas = canvas;
+    this.device = device;
+    this.context = context;
+    this.compute = compute;
+    this.render = render;
     this.camera = device.createBuffer({
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.counters = device.createBuffer({
-      size: 20,
-      usage:
-        GPUBufferUsage.STORAGE |
-        GPUBufferUsage.INDIRECT |
-        GPUBufferUsage.COPY_DST |
-        GPUBufferUsage.COPY_SRC,
     });
     this.readback = device.createBuffer({
       size: 20,
@@ -161,67 +155,99 @@ export class Renderer {
     return new Renderer(canvas, device, context, compute, render);
   }
   load(mesh: GpuMesh): void {
+    // Each batch remaps its vertices, so neither input nor output depends on
+    // the total model size. Only one worst-case section buffer is allocated.
+    const limit = Math.min(this.device.limits.maxStorageBufferBindingSize,
+      this.device.limits.maxBufferSize, 32 * 1024 * 1024);
+    const capacity = Math.floor(Math.min(limit / 192,
+      this.device.limits.maxComputeWorkgroupsPerDimension * 64));
+    if (capacity < 1) throw new Error("GPU buffer capacity is insufficient");
     const count = mesh.indices.length / 8;
-    const outputSize = Math.max(32, count * 6 * 32);
-    if (
-      outputSize > this.device.limits.maxStorageBufferBindingSize ||
-      outputSize > this.device.limits.maxBufferSize
-    )
-      throw new Error(
-        `GPU メモリ上限を超えています。この環境では最大 ${Math.floor(Math.min(this.device.limits.maxStorageBufferBindingSize, this.device.limits.maxBufferSize) / 192).toLocaleString()} 胞まで読み込めます。`,
-      );
-    if (
-      Math.ceil(count / 64) >
-      this.device.limits.maxComputeWorkgroupsPerDimension
-    )
-      throw new Error("GPU dispatch limit exceeded");
-    for (const data of [mesh.positions, mesh.indices])
-      if (data.byteLength > this.device.limits.maxStorageBufferBindingSize)
-        throw new Error("Input exceeds GPU storage buffer limit");
+    const hasVertexNormals = !!mesh.vertexNormals?.length;
+    const hasCellNormals = !!mesh.cellNormals?.length;
+    if (hasVertexNormals && mesh.vertexNormals!.length !== mesh.positions.length)
+      throw new Error("Vertex normal count mismatch");
+    if (hasCellNormals && mesh.cellNormals!.length !== count * 4)
+      throw new Error("Cell normal count mismatch");
+    const flags = Number(hasVertexNormals) | (Number(hasCellNormals) << 1);
+    const buffers: GPUBuffer[] = [];
     const upload = (data: Float32Array | Uint32Array) => {
-      const buffer = this.device.createBuffer({
-        size: Math.max(16, data.byteLength),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-      this.device.queue.writeBuffer(
-        buffer,
-        0,
-        data as GPUAllowSharedBufferSource,
-      );
+      const buffer = this.device.createBuffer({ size: Math.max(16, data.byteLength),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      buffers.push(buffer);
+      this.device.queue.writeBuffer(buffer, 0, data as GPUAllowSharedBufferSource);
       return buffer;
     };
-    const positions = upload(mesh.positions),
-      indices = upload(mesh.indices);
     const output = this.device.createBuffer({
-      size: outputSize,
-      usage: GPUBufferUsage.STORAGE,
-    });
-    const computeGroup = this.device.createBindGroup({
-      layout: this.compute.getBindGroupLayout(0),
-      entries: [positions, indices, output, this.counters, this.params].map(
-        (buffer, binding) => ({ binding, resource: { buffer } }),
-      ),
-    });
-    const renderGroup = this.device.createBindGroup({
-      layout: this.render.getBindGroupLayout(0),
-      entries: [output, this.camera].map((buffer, binding) => ({
-        binding,
-        resource: { buffer },
-      })),
-    });
-    this.meshBuffers.forEach((b) => b.destroy());
-    this.meshBuffers = [positions, indices, output];
-    this.computeGroup = computeGroup;
-    this.renderGroup = renderGroup;
-    this.cells = count;
-    this.center = new Float32Array(mesh.center);
-    this.radius = Math.max(mesh.radius, 1e-30);
-    this.generation++;
+      size: Math.max(32, Math.min(count, capacity) * 192),
+      usage: GPUBufferUsage.STORAGE });
+    buffers.push(output);
+    const batches: typeof this.batches = [];
+    try {
+      for (let start = 0; start < count; start += capacity) {
+        const size = Math.min(capacity, count - start);
+        const ids = new Map<number, number>();
+        const packed = mesh.indices.slice(start * 8, (start + size) * 8);
+        const points: number[] = [];
+        const normals: number[] = [];
+        for (let cell = 0; cell < size; cell++) {
+          for (let corner = 0; corner < 4; corner++) {
+            const at = cell * 8 + corner;
+            const original = packed[at];
+            let local = ids.get(original);
+            if (local === undefined) {
+              local = ids.size;
+              ids.set(original, local);
+              for (let axis = 0; axis < 4; axis++) {
+                points.push(mesh.positions[original * 4 + axis]);
+                if (hasVertexNormals) normals.push(mesh.vertexNormals![original * 4 + axis]);
+              }
+            }
+            packed[at] = local;
+          }
+        }
+        const positions = upload(new Float32Array(points));
+        const indices = upload(packed);
+        const vertexNormals = upload(hasVertexNormals ? new Float32Array(normals) : new Float32Array(4));
+        const cellNormals = upload(hasCellNormals
+          ? mesh.cellNormals!.subarray(start * 4, (start + size) * 4) : new Float32Array(4));
+        const params = this.device.createBuffer({ size: 112,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        const counters = this.device.createBuffer({ size: 20,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT |
+            GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+        buffers.push(params, counters);
+        const computeGroup = this.device.createBindGroup({
+          layout: this.compute.getBindGroupLayout(0),
+          entries: [positions, indices, output, counters, params, vertexNormals, cellNormals].map(
+            (buffer, binding) => ({ binding, resource: { buffer } })),
+        });
+        batches.push({ flags, count: size, params, counters, computeGroup });
+      }
+      const renderGroup = this.device.createBindGroup({
+        layout: this.render.getBindGroupLayout(0),
+        entries: [output, this.camera].map((buffer, binding) => ({
+          binding, resource: { buffer } })),
+      });
+      const readback = this.device.createBuffer({ size: Math.max(20, batches.length * 20),
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      this.meshBuffers.forEach((buffer) => buffer.destroy());
+      this.readback.destroy();
+      this.readback = readback;
+      this.meshBuffers = buffers;
+      this.batches = batches;
+      this.renderGroup = renderGroup;
+      this.center = new Float32Array(mesh.center);
+      this.radius = Math.max(mesh.radius, 1e-30);
+      this.generation++;
+    } catch (error) {
+      buffers.forEach((buffer) => buffer.destroy());
+      throw error;
+    }
   }
-  draw(scene: Scene, recompute = true): void {
-    if (this.destroyed || !this.computeGroup || !this.renderGroup) return;
+  draw(scene: Scene, _recompute = true): void {
+    if (this.destroyed || !this.batches.length || !this.renderGroup) return;
     this.scene = scene;
-    this.computeDirty ||= recompute;
     const width = Math.max(
       1,
       Math.min(
@@ -266,75 +292,63 @@ export class Renderer {
     );
     const encoder = this.device.createCommandEncoder();
     const started = performance.now();
-    const computeNow = this.computeDirty;
-    this.computeDirty = false;
-    if (computeNow) {
-      this.needStats = true;
+    // Output storage is reused between batches. Compute and draw remain on GPU;
+    // camera-only changes recompute as well because earlier batches are not cached.
+    this.needStats = true;
+    const read = !this.reading;
+    const readback = this.readback;
+    const generation = this.generation;
+    if (read) { this.needStats = false; this.reading = true; }
+    const view = this.context.getCurrentTexture().createView();
+    this.batches.forEach((batch, index) => {
       const bytes = new ArrayBuffer(112);
       const floats = new Float32Array(bytes);
       floats.set(rotation4(scene.angles));
       floats.set(this.center, 16);
-      floats.set(
-        [scene.offset, scene.axis, this.radius * 1e-6, this.radius],
-        20,
-      );
-      new Uint32Array(bytes).set([this.cells, 0, 0, 0], 24);
-      this.device.queue.writeBuffer(this.params, 0, bytes);
-      this.device.queue.writeBuffer(
-        this.counters,
-        0,
-        new Uint32Array([0, 1, 0, 0, 0]),
-      );
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(this.compute);
-      pass.setBindGroup(0, this.computeGroup);
-      pass.dispatchWorkgroups(Math.ceil(this.cells / 64));
-      pass.end();
-    }
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.context.getCurrentTexture().createView(),
+      floats.set([scene.offset, scene.axis, this.radius * 1e-6, this.radius], 20);
+      new Uint32Array(bytes).set([batch.count, scene.smooth ? batch.flags : batch.flags & 2, 0, 0], 24);
+      this.device.queue.writeBuffer(batch.params, 0, bytes);
+      this.device.queue.writeBuffer(batch.counters, 0, new Uint32Array([0, 1, 0, 0, 0]));
+      const compute = encoder.beginComputePass();
+      compute.setPipeline(this.compute);
+      compute.setBindGroup(0, batch.computeGroup);
+      compute.dispatchWorkgroups(Math.ceil(batch.count / 64));
+      compute.end();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{ view,
           clearValue: { r: 0.025, g: 0.036, b: 0.055, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
-      depthStencilAttachment: {
-        view: this.depth!.createView(),
-        depthClearValue: 1,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
-      },
+          loadOp: index === 0 ? "clear" : "load", storeOp: "store" }],
+        depthStencilAttachment: { view: this.depth!.createView(),
+          depthClearValue: 1, depthLoadOp: index === 0 ? "clear" : "load",
+          depthStoreOp: "store" },
+      });
+      pass.setPipeline(this.render);
+      pass.setBindGroup(0, this.renderGroup!);
+      pass.drawIndirect(batch.counters, 0);
+      pass.end();
+      if (read) encoder.copyBufferToBuffer(batch.counters, 0, readback, index * 20, 20);
     });
-    pass.setPipeline(this.render);
-    pass.setBindGroup(0, this.renderGroup);
-    pass.drawIndirect(this.counters, 0);
-    pass.end();
-    const read = this.needStats && !this.reading;
-    const generation = this.generation;
-    if (read) {
-      this.needStats = false;
-      this.reading = true;
-      encoder.copyBufferToBuffer(this.counters, 0, this.readback, 0, 20);
-    }
     this.device.queue.submit([encoder.finish()]);
     if (read) {
-      void this.readback
+      void readback
         .mapAsync(GPUMapMode.READ)
         .then(() => {
           if (this.destroyed) return;
-          const counts = new Uint32Array(this.readback.getMappedRange());
+          const counts = new Uint32Array(readback.getMappedRange());
+          let vertices = 0, coplanar = 0;
+          for (let at = 0; at < counts.length; at += 5) {
+            vertices += counts[at]; coplanar += counts[at + 4];
+          }
           const stats = {
-            triangles: counts[0] / 3,
-            coplanar: counts[4],
+            triangles: vertices / 3,
+            coplanar,
             milliseconds: performance.now() - started,
           };
-          this.readback.unmap();
+          readback.unmap();
           if (generation === this.generation) this.onStats?.(stats);
         })
         .catch((error) => {
-          if (!this.destroyed) this.onError?.(String(error));
+          if (!this.destroyed && generation === this.generation) this.onError?.(String(error));
         })
         .finally(() => {
           this.reading = false;
@@ -348,9 +362,7 @@ export class Renderer {
     this.observer.disconnect();
     this.meshBuffers.forEach((b) => b.destroy());
     this.depth?.destroy();
-    this.params.destroy();
     this.camera.destroy();
-    this.counters.destroy();
     this.readback.destroy();
     this.context.unconfigure();
     this.device.destroy();

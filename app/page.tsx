@@ -10,19 +10,10 @@ const INITIAL: Scene = {
   pitch: -0.32,
   distance: 2.8,
   style: 1,
+  smooth: false,
 };
 const AXES = ["X", "Y", "Z", "W"];
 const PLANES = ["XY", "XZ", "XW", "YZ", "YW", "ZW"];
-function download(bytes: Uint8Array, name: string) {
-  const url = URL.createObjectURL(
-    new Blob([bytes.slice().buffer], { type: "application/octet-stream" }),
-  );
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
 export default function Page() {
   const canvas = useRef<HTMLCanvasElement>(null),
     renderer = useRef<Renderer | null>(null),
@@ -30,6 +21,7 @@ export default function Page() {
     input = useRef<HTMLInputElement>(null);
   const sceneRef = useRef<Scene>(INITIAL),
     radiusRef = useRef(1),
+    durationRef = useRef(30),
     frame = useRef(0),
     pendingCompute = useRef(false);
   const [scene, setScene] = useState<Scene>(INITIAL),
@@ -45,6 +37,7 @@ export default function Page() {
     }),
     [oneBased, setOneBased] = useState(false),
     [playing, setPlaying] = useState(false),
+    [duration, setDuration] = useState(30),
     [busy, setBusy] = useState(false);
   const change = useCallback((patch: Partial<Scene>, compute = true) => {
     const next = { ...sceneRef.current, ...patch };
@@ -63,6 +56,8 @@ export default function Page() {
         renderer.current!.load({
           positions: next.positions(),
           indices: next.gpu_cells(),
+          vertexNormals: next.vertex_normals(),
+          cellNormals: next.cell_normals(),
           center: next.center(),
           radius: next.radius(),
         });
@@ -121,15 +116,22 @@ export default function Page() {
     const tick = (now: number) => {
       if (previous) {
         const r = radiusRef.current;
-        let offset = sceneRef.current.offset + (now - previous) * 0.00025 * r;
-        if (offset > r) offset = -r;
+        // Pause elapsed time while hidden; preserve overshoot at the loop boundary.
+        const elapsed = document.hidden ? 0 : now - previous;
+        const distance = elapsed / (durationRef.current * 1000) * 2 * r;
+        const offset = ((sceneRef.current.offset + r + distance) % (2 * r)) - r;
         change({ offset });
       }
       previous = now;
       id = requestAnimationFrame(tick);
     };
+    const resetClock = () => { previous = 0; };
+    document.addEventListener("visibilitychange", resetClock);
     id = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(id);
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("visibilitychange", resetClock);
+    };
   }, [playing, change]);
   async function sample(kind: number) {
     setPlaying(false);
@@ -150,8 +152,6 @@ export default function Page() {
     setBusy(true);
     setPlaying(false);
     try {
-      if (file.size > 64 * 1024 * 1024)
-        throw new Error("ファイル上限は 64 MiB です。");
       const core = await loadCore();
       const bytes = new Uint8Array(await file.arrayBuffer());
       install(new core.ViewerModel(bytes, oneBased), file.name);
@@ -225,7 +225,7 @@ export default function Page() {
               ))}
             </div>
             <p className="note">
-              type 1 · little-endian · 法線なし
+              type 1–4 · little-endian
               <br />
               ファイルはブラウザ内で処理されます。
             </p>
@@ -292,6 +292,19 @@ export default function Page() {
             >
               {playing ? "Ⅱ  停止" : "▷  断面を再生"}
             </button>
+            <div className="label-row">
+              <label htmlFor="duration">1周の時間（秒）</label>
+              <input id="duration" type="number" min={1} max={3600} step={1}
+                value={duration} disabled={!ready}
+                onChange={(e) => {
+                  const value = e.target.valueAsNumber;
+                  if (Number.isFinite(value) && value >= 1 && value <= 3600) {
+                    durationRef.current = value;
+                    setDuration(value);
+                  }
+                }} />
+            </div>
+            <p className="note">−R → +R を {duration} 秒で移動します。<br />長くするとゆっくり再生します。</p>
             <p className="note">
               モデル中心を原点とする座標です。
               <br />R はモデルの外接半径。
@@ -348,6 +361,15 @@ export default function Page() {
                 </button>
               ))}
             </div>
+            <div className="segmented" aria-label="陰影">
+              {["フラット", "滑らか"].map((label, i) => (
+                <button key={label} disabled={!ready}
+                  aria-pressed={scene.smooth === (i === 1)}
+                  onClick={() => change({ smooth: i === 1 })}>
+                  {label}
+                </button>
+              ))}
+            </div>
             <div className="actions">
               <button
                 disabled={!ready}
@@ -363,15 +385,6 @@ export default function Page() {
                 }
               >
                 カメラを戻す
-              </button>
-              <button
-                disabled={!ready}
-                onClick={() => {
-                  if (model.current)
-                    download(model.current.export_te4(), "model.te4");
-                }}
-              >
-                TE4 保存
               </button>
             </div>
           </section>

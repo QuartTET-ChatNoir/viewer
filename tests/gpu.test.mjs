@@ -103,7 +103,10 @@ async function run(model, axis, offset, angles) {
     f.set(rotation(angles));
     f.set(model.center(), 16);
     f.set([offset, axis, model.radius() * 1e-6, model.radius()], 20);
-    new Uint32Array(raw).set([count, 0, 0, 0], 24);
+    const vertexNormals = model.vertex_normals();
+    const cellNormals = model.cell_normals();
+    const flags = Number(vertexNormals.length > 0) | (Number(cellNormals.length > 0) << 1);
+    new Uint32Array(raw).set([count, flags, 0, 0], 24);
     device.queue.writeBuffer(uniform, 0, raw);
     device.queue.writeBuffer(counters, 0, new Uint32Array([0, 1, 0, 0, 0]));
     const group = device.createBindGroup({
@@ -114,6 +117,8 @@ async function run(model, axis, offset, angles) {
         output,
         counters,
         uniform,
+        input(vertexNormals.length ? vertexNormals : new Float32Array(4)),
+        input(cellNormals.length ? cellNormals : new Float32Array(4)),
       ].map((b, binding) => ({ binding, resource: { buffer: b } })),
     });
     const read = buffer(
@@ -334,5 +339,127 @@ test("render shader and indirect draw are valid", async () => {
     [geometry, camera, indirect, read].forEach((x) => x.destroy());
     color.destroy();
     depth.destroy();
+  }
+});
+
+test("batched renderer preserves the section, depth and statistics", async () => {
+  const { Renderer } = await import("../src/gpu.ts");
+  globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+  globalThis.devicePixelRatio = 1;
+  const renderModule = device.createShaderModule({ code: await readFile(
+    new URL("../public/shaders/render.wgsl", import.meta.url), "utf8") });
+  const renderPipeline = await device.createRenderPipelineAsync({ layout: "auto",
+    vertex: { module: renderModule, entryPoint: "vs" },
+    fragment: { module: renderModule, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
+    primitive: { topology: "triangle-list", cullMode: "none" },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" } });
+  const model = ViewerModel.sample(0);
+  const mesh = { positions: model.positions(), indices: model.gpu_cells(),
+    vertexNormals: model.vertex_normals(), cellNormals: model.cell_normals(),
+    center: model.center(), radius: model.radius() };
+  async function draw(limit, offset, smooth) {
+    const color = device.createTexture({ size: [64, 64], format: "rgba8unorm",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const proxy = new Proxy(device, { get(target, key) {
+      if (key === "limits") return { maxStorageBufferBindingSize: limit,
+        maxBufferSize: limit, maxComputeWorkgroupsPerDimension: 65535,
+        maxTextureDimension2D: 8192 };
+      if (key === "destroy") return () => {};
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }});
+    const renderer = new Renderer({ clientWidth: 64, clientHeight: 64, width: 0, height: 0 },
+      proxy, { getCurrentTexture: () => color, unconfigure() {} }, pipeline, renderPipeline);
+    const read = device.createBuffer({ size: 64 * 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      renderer.load(mesh);
+      const stats = await new Promise((resolve, reject) => {
+        renderer.onStats = resolve; renderer.onError = reject;
+        renderer.draw({ axis: 3, offset, angles: [0,0,0,0,0,0],
+          yaw: 0.55, pitch: -0.32, distance: 2.8, style: 1, smooth });
+      });
+      const encoder = device.createCommandEncoder();
+      encoder.copyTextureToBuffer({ texture: color }, { buffer: read, bytesPerRow: 256 }, [64,64]);
+      device.queue.submit([encoder.finish()]);
+      await read.mapAsync(GPUMapMode.READ);
+      const pixels = new Uint8Array(read.getMappedRange()).slice();
+      read.unmap();
+      return { stats, pixels };
+    } finally { renderer.destroy(); read.destroy(); color.destroy(); }
+  }
+  try {
+    for (const offset of [0, 1]) for (const smooth of [false,true]) {
+      const whole = await draw(1 << 20, offset, smooth);
+      const batches = await draw(1536, offset, smooth); // 8 cells per batch, crossing shared faces
+      assert.equal(batches.stats.triangles, whole.stats.triangles);
+      assert.equal(batches.stats.coplanar, whole.stats.coplanar);
+      assert.deepEqual(batches.pixels, whole.pixels);
+    }
+  } finally { model.free(); }
+});
+
+function te4WithNormals(kind, vertexNormals, cellNormals) {
+  const positions = [[0,0,0,-1], [0,1,0,1], [0,0,1,1], [0,-1,-1,1]];
+  const bytes = new Uint8Array(12 + 64 + 16 +
+    ((kind === 2 || kind === 4) ? 64 : 0) + ((kind === 3 || kind === 4) ? 16 : 0));
+  const view = new DataView(bytes.buffer);
+  [kind,4,1].forEach((v,i) => view.setUint32(i*4,v,true));
+  let at = 12;
+  for (const p of positions) for (const value of p) { view.setFloat32(at,value,true); at+=4; }
+  for (const value of [0,1,2,3]) { view.setUint32(at,value,true); at+=4; }
+  if (kind === 2 || kind === 4) for (const normal of vertexNormals)
+    for (const value of normal) { view.setFloat32(at,value,true); at+=4; }
+  if (kind === 3 || kind === 4) for (const value of cellNormals) { view.setFloat32(at,value,true); at+=4; }
+  return { model: new ViewerModel(bytes,false), positions };
+}
+function unit(v) {
+  const length = Math.hypot(...v);
+  return length ? v.map(x => x/length) : v.map(() => 0);
+}
+function rotatePoint(matrix, point) {
+  return [0,1,2,3].map(row => point.reduce((sum,x,col) => sum + matrix[col*4+row]*x,0));
+}
+for (const kind of [2,3,4]) test(`type ${kind} normals are rotated, interpolated and projected on GPU`, async () => {
+  const normals = [[-1,0,0,0],[-1,0.5,0,0],[-1,0,0.4,0],[-1,-0.2,0.3,0]].map(unit);
+  const { model, positions } = te4WithNormals(kind,normals,[-1,0,0,0]);
+  const angles = [0.31,-0.2,0.4,0.15,0.18,-0.27];
+  const matrix = rotation(angles);
+  const center = model.center();
+  const points = positions.map(p => rotatePoint(matrix,p.map((x,i)=>x-center[i])));
+  const offset = points.reduce((sum,p)=>sum+p[3],0)/4;
+  const projectedCell = unit(rotatePoint(matrix,[-1,0,0,0]).slice(0,3));
+  const expected = [];
+  for (let a=0;a<4;a++) for (let b=a+1;b<4;b++) {
+    const da = points[a][3]-offset, db = points[b][3]-offset;
+    if (da*db >= 0) continue;
+    const t = da/(da-db);
+    const p = points[a].slice(0,3).map((x,i)=>(x+t*(points[b][i]-x))/model.radius());
+    const interpolated = normals[a].map((x,i)=>x+t*(normals[b][i]-x));
+    const normal = kind === 3 ? projectedCell : unit(rotatePoint(matrix,interpolated).slice(0,3));
+    expected.push({p,normal});
+  }
+  try {
+    const result = await run(model,3,offset,angles);
+    assert.ok(result.vertices.length > 0);
+    for (let at=0;at<result.vertices.length;at+=8) {
+      const match = expected.find(({p})=>p.every((x,i)=>Math.abs(x-result.vertices[at+i])<1e-5));
+      assert.ok(match,"intersection matches an original edge");
+      for (let i=0;i<3;i++) assert.ok(Math.abs(match.normal[i]-result.vertices[at+4+i])<1e-5);
+    }
+  } finally { model.free(); }
+});
+
+test("zero or plane-parallel projected normals fall back to finite geometric normals", async () => {
+  for (const normals of [[[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]],
+    [[0,0,0,1],[0,0,0,1],[0,0,0,1],[0,0,0,1]]]) {
+    const { model } = te4WithNormals(4,normals,[0,0,0,1]);
+    try {
+      const result = await run(model,3,0,[0,0,0,0,0,0]);
+      for (let at=0;at<result.vertices.length;at+=8) {
+        assert.ok(result.vertices.slice(at+4,at+7).every(Number.isFinite));
+        assert.ok(Math.abs(Math.hypot(...result.vertices.slice(at+4,at+7))-1)<1e-6);
+      }
+    } finally { model.free(); }
   }
 });

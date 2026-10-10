@@ -3,11 +3,12 @@ export type Model = {
   positions(): Float32Array;
   indices(): Uint32Array;
   gpu_cells(): Uint32Array;
+  vertex_normals(): Float32Array;
+  cell_normals(): Float32Array;
   center(): Float64Array;
   radius(): number;
   vertex_count(): number;
   cell_count(): number;
-  export_te4(): Uint8Array;
 };
 export type Core = {
   ViewerModel: {
