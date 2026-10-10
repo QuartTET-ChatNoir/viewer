@@ -12,6 +12,8 @@ const INITIAL: Scene = {
   distance: 2.8,
   style: 1,
   smooth: false,
+  mode: 0,
+  projectionDistance: 3,
 };
 const AXES = ["X", "Y", "Z", "W"];
 const PLANES = ["XY", "XZ", "XW", "YZ", "YW", "ZW"];
@@ -230,9 +232,30 @@ export default function Page() {
           <section>
             <div className="section-title">
               <span>02</span>
-              <h2>断面</h2>
+              <h2>切断・投影</h2>
             </div>
-            <div className="segmented" aria-label="切断軸">
+            <div className="segmented" aria-label="描画モード">
+              {["超平面切断", "投影"].map((label,i)=>(
+                <button key={label} disabled={!ready} aria-pressed={i===0?scene.mode===0:scene.mode!==0}
+                  onClick={()=>{setPlaying(false);change({mode:i,style:i===1?2:1,smooth:false});}}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {scene.mode!==0 && <>
+              <div className="segmented" aria-label="4D投影方式">
+                {["平行投影", "透視投影"].map((label,i)=>(
+                  <button key={label} disabled={!ready} aria-pressed={scene.mode===i+1}
+                    onClick={()=>change({mode:i+1})}>{label}</button>
+                ))}
+              </div>
+              {scene.mode===2 && <label>4D視点の距離：{(scene.projectionDistance??3).toFixed(2)} R
+                <input type="range" min={1.25} max={8} step={0.05} disabled={!ready} value={scene.projectionDistance}
+                  onChange={e=>change({projectionDistance:Number(e.target.value)})}/>
+              </label>}
+              <p className="note">選択軸を奥行きとして4Dから3Dへ投影します。</p>
+            </>}
+            <div className="segmented" aria-label={scene.mode===0?"切断軸":"投影軸"}>
               {AXES.map((a, i) => (
                 <button
                   key={a}
@@ -247,6 +270,7 @@ export default function Page() {
                 </button>
               ))}
             </div>
+            {scene.mode===0 && <>
             <div className="label-row">
               <label htmlFor="offset">{AXES[scene.axis]} =</label>
               <input
@@ -306,6 +330,7 @@ export default function Page() {
               モデル中心を原点とする座標です。
               <br />R はモデルの外接半径。
             </p>
+            </>}
           </section>
           <section>
             <div className="section-title">
@@ -360,7 +385,7 @@ export default function Page() {
             </div>
             <div className="segmented" aria-label="陰影">
               {["フラット", "滑らか"].map((label, i) => (
-                <button key={label} disabled={!ready}
+                <button key={label} disabled={!ready || scene.mode!==0}
                   aria-pressed={scene.smooth === (i === 1)}
                   onClick={() => change({ smooth: i === 1 })}>
                   {label}
@@ -397,17 +422,17 @@ export default function Page() {
         >
           <div className="view-top">
             <div>
-              <span className="eyebrow">HYPERPLANE SECTION</span>
+              <span className="eyebrow">{scene.mode===0?"HYPERPLANE SECTION":"4D PROJECTION"}</span>
               <h2>{name}</h2>
             </div>
             <span className="axis-badge">
               {AXES[scene.axis]}
-              <small>定値断面</small>
+              <small>{scene.mode===0?"定値断面":"投影軸"}</small>
             </span>
           </div>
           <canvas
             ref={canvas}
-            aria-label="4次元モデルの3次元断面"
+            aria-label={scene.mode===0?"4次元モデルの3次元断面":"4次元モデルの3次元投影"}
             onPointerDown={(e) => {
               drag.current = {
                 x: e.clientX,
@@ -466,7 +491,7 @@ export default function Page() {
           )}
           {ready && stats.triangles === 0 && (
             <div className="center-message">
-              この位置には面の断面がありません
+              {scene.mode===0?"この位置には面の断面がありません":"この投影には描画可能な面がありません"}
             </div>
           )}
           {error && (

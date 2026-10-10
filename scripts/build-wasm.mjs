@@ -36,3 +36,5 @@ copyFileSync(
   resolve(core, "shaders/section.wgsl"),
   resolve("public/shaders/section.wgsl"),
 );
+
+copyFileSync(resolve(core, "shaders/cull.wgsl"), resolve("public/shaders/cull.wgsl"));

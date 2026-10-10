@@ -7,3 +7,4 @@
 /.core
 
 /public/shaders/section.wgsl
+/public/shaders/cull.wgsl

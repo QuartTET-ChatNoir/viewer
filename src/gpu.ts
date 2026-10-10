@@ -1,3 +1,4 @@
+import { buildBvh } from "./bvh.ts";
 export type GpuMesh = {
   positions: Float32Array;
   indices: Uint32Array;
@@ -15,6 +16,9 @@ export type Scene = {
   distance: number;
   style: number;
   smooth: boolean;
+  mode?: number; // 0 section, 1 parallel projection, 2 perspective projection
+  projectionDistance?: number;
+  acceleration?: boolean;
 };
 export type Stats = {
   triangles: number;
@@ -47,7 +51,7 @@ export function rotation4(angles: number[]): Float32Array {
 }
 export class Renderer {
   private meshBuffers: GPUBuffer[] = [];
-  private batches: { flags: number; count: number; params: GPUBuffer; counters: GPUBuffer; computeGroup: GPUBindGroup }[] = [];
+  private batches: { flags: number; count: number; params: GPUBuffer; counters: GPUBuffer; computeGroup: GPUBindGroup; cullGroup?: GPUBindGroup; prepareGroup?: GPUBindGroup; roots: number; dispatchArgs: GPUBuffer }[] = [];
   private renderGroup?: GPUBindGroup;
   private depth?: GPUTexture;
   private center = new Float32Array(4);
@@ -68,15 +72,19 @@ export class Renderer {
   private context: GPUCanvasContext;
   private compute: GPUComputePipeline;
   private render: GPURenderPipeline;
+  private cull?: GPUComputePipeline;
+  private prepare?: GPUComputePipeline;
   private constructor(
     canvas: HTMLCanvasElement, device: GPUDevice, context: GPUCanvasContext,
     compute: GPUComputePipeline, render: GPURenderPipeline,
+    cull?: GPUComputePipeline, prepare?: GPUComputePipeline,
   ) {
     this.canvas = canvas;
     this.device = device;
     this.context = context;
     this.compute = compute;
     this.render = render;
+    this.cull = cull; this.prepare = prepare;
     this.camera = device.createBuffer({
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -116,7 +124,7 @@ export class Renderer {
     if (!context) throw new Error("WebGPU canvas の初期化に失敗しました。");
     const base = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
     const sources = await Promise.all(
-      ["section", "render"].map(async (name) => {
+      ["section", "render", "cull"].map(async (name) => {
         const response = await fetch(`${base}/shaders/${name}.wgsl`);
         if (!response.ok) throw new Error(`Shader fetch failed: ${name}`);
         return response.text();
@@ -133,6 +141,10 @@ export class Renderer {
       layout: "auto",
       compute: { module: modules[0], entryPoint: "main" },
     });
+    const cull = await device.createComputePipelineAsync({layout:"auto",
+      compute:{module:modules[2],entryPoint:"main"}});
+    const prepare = await device.createComputePipelineAsync({layout:"auto",
+      compute:{module:modules[2],entryPoint:"prepare"}});
     const render = await device.createRenderPipelineAsync({
       layout: "auto",
       vertex: { module: modules[1], entryPoint: "vs" },
@@ -153,14 +165,14 @@ export class Renderer {
       format: navigator.gpu.getPreferredCanvasFormat(),
       alphaMode: "opaque",
     });
-    return new Renderer(canvas, device, context, compute, render);
+    return new Renderer(canvas, device, context, compute, render, cull, prepare);
   }
   load(mesh: GpuMesh): void {
     // Each batch remaps its vertices, so neither input nor output depends on
     // the total model size. Only one worst-case section buffer is allocated.
     const limit = Math.min(this.device.limits.maxStorageBufferBindingSize,
       this.device.limits.maxBufferSize, 32 * 1024 * 1024);
-    const capacity = Math.floor(Math.min(limit / 192,
+    const capacity = Math.floor(Math.min(limit / 384,
       this.device.limits.maxComputeWorkgroupsPerDimension * 64));
     if (capacity < 1) throw new Error("GPU buffer capacity is insufficient");
     const count = mesh.indices.length / 8;
@@ -180,7 +192,7 @@ export class Renderer {
       return buffer;
     };
     const output = this.device.createBuffer({
-      size: Math.max(32, Math.min(count, capacity) * 192),
+      size: Math.max(32, Math.min(count, capacity) * 384),
       usage: GPUBufferUsage.STORAGE });
     buffers.push(output);
     const batches: typeof this.batches = [];
@@ -207,24 +219,41 @@ export class Renderer {
             packed[at] = local;
           }
         }
-        const positions = upload(new Float32Array(points));
-        const indices = upload(packed);
+        const positionData=new Float32Array(points);
+        const bvh=buildBvh(positionData,packed);
+        const ordered=new Uint32Array(packed.length);
+        const normalData=hasCellNormals ? new Float32Array(size*4) : new Float32Array(4);
+        bvh.order.forEach((cell,id)=>{
+          ordered.set(packed.subarray(cell*8,cell*8+8),id*8);
+          if(hasCellNormals)normalData.set(mesh.cellNormals!.subarray((start+cell)*4,(start+cell)*4+4),id*4);
+        });
+        const positions = upload(positionData);
+        const indices = upload(ordered);
+        const nodes=upload(bvh.nodes);
+        const candidates=upload(new Uint32Array(size));
         const originalIds = upload(new Uint32Array(ids.keys()));
         const vertexNormals = upload(hasVertexNormals ? new Float32Array(normals) : new Float32Array(4));
-        const cellNormals = upload(hasCellNormals
-          ? mesh.cellNormals!.subarray(start * 4, (start + size) * 4) : new Float32Array(4));
+        const cellNormals = upload(normalData);
         const params = this.device.createBuffer({ size: 112,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        const counters = this.device.createBuffer({ size: 20,
+        const counters = this.device.createBuffer({ size: 36,
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT |
             GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-        buffers.push(params, counters);
+        const dispatchArgs=this.device.createBuffer({size:12,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT});
+        buffers.push(params, counters, dispatchArgs);
         const computeGroup = this.device.createBindGroup({
           layout: this.compute.getBindGroupLayout(0),
-          entries: [positions, indices, output, counters, params, vertexNormals, cellNormals, originalIds].map(
+          entries: [positions, indices, output, counters, params, vertexNormals, cellNormals, originalIds, candidates].map(
             (buffer, binding) => ({ binding, resource: { buffer } })),
         });
-        batches.push({ flags, count: size, params, counters, computeGroup });
+        const cullGroup=this.cull ? this.device.createBindGroup({
+          layout:this.cull.getBindGroupLayout(0),
+          entries:[nodes,candidates,counters,params].map((buffer,binding)=>({binding,resource:{buffer}})),
+        }):undefined;
+        const prepareGroup=this.prepare ? this.device.createBindGroup({
+          layout:this.prepare.getBindGroupLayout(0),entries:[{binding:2,resource:{buffer:counters}},{binding:4,resource:{buffer:dispatchArgs}}],
+        }):undefined;
+        batches.push({ flags, count: size, params, counters, computeGroup, cullGroup, prepareGroup, roots:bvh.roots, dispatchArgs });
       }
       const renderGroup = this.device.createBindGroup({
         layout: this.render.getBindGroupLayout(0),
@@ -318,14 +347,25 @@ export class Renderer {
       const floats = new Float32Array(bytes);
       floats.set(rotation4(scene.angles));
       floats.set(this.center, 16);
-      floats.set([scene.offset, scene.axis, this.radius * 1e-6, this.radius], 20);
-      new Uint32Array(bytes).set([batch.count, scene.smooth ? batch.flags : batch.flags & 2, 0, 0], 24);
+      const mode=scene.mode??0;
+      const accelerated=mode===0 && scene.acceleration!==false && !!this.cull && !!this.prepare;
+      const flags=(scene.smooth ? batch.flags : batch.flags & 2) | (accelerated?4:0);
+      floats.set([mode===0?scene.offset:Math.max(1.25,scene.projectionDistance??3)*this.radius,
+        scene.axis, this.radius * 1e-6, this.radius], 20);
+      new Uint32Array(bytes).set([batch.count, flags, mode, batch.roots], 24);
       this.device.queue.writeBuffer(batch.params, 0, bytes);
-      this.device.queue.writeBuffer(batch.counters, 0, new Uint32Array([0, 1, 0, 0, 0]));
+      this.device.queue.writeBuffer(batch.counters, 0, new Uint32Array([0, 1, 0, 0, 0, 0, 0, 1, 1]));
+      if(accelerated) {
+        const cull=encoder.beginComputePass();cull.setPipeline(this.cull!);
+        cull.setBindGroup(0,batch.cullGroup!);cull.dispatchWorkgroups(Math.ceil(batch.roots/64));cull.end();
+        const prepare=encoder.beginComputePass();prepare.setPipeline(this.prepare!);
+        prepare.setBindGroup(0,batch.prepareGroup!);prepare.dispatchWorkgroups(1);prepare.end();
+      }
       const compute = encoder.beginComputePass();
       compute.setPipeline(this.compute);
       compute.setBindGroup(0, batch.computeGroup);
-      compute.dispatchWorkgroups(Math.ceil(batch.count / 64));
+      if(accelerated)compute.dispatchWorkgroupsIndirect(batch.dispatchArgs,0);
+      else compute.dispatchWorkgroups(Math.ceil(batch.count / 64));
       compute.end();
       const pass = encoder.beginRenderPass({
         colorAttachments: [{ view,

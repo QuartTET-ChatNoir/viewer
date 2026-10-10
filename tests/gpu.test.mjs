@@ -4,7 +4,8 @@ import { readFile } from "node:fs/promises";
 import { create, globals } from "webgpu";
 import init, { ViewerModel } from "../public/wasm/quarttet_core.js";
 Object.assign(globalThis, globals);
-let gpu, device, pipeline;
+import { buildBvh } from "../src/bvh.ts";
+let gpu, device, pipeline, cullPipeline, preparePipeline;
 before(async () => {
   await init({
     module_or_path: await readFile(
@@ -36,6 +37,11 @@ before(async () => {
     layout: "auto",
     compute: { module, entryPoint: "main" },
   });
+
+ const cullModule=device.createShaderModule({code:await readFile(new URL("../public/shaders/cull.wgsl",import.meta.url),"utf8")});
+ assert.deepEqual((await cullModule.getCompilationInfo()).messages.filter(x=>x.type==="error"),[]);
+ cullPipeline=await device.createComputePipelineAsync({layout:"auto",compute:{module:cullModule,entryPoint:"main"}});
+ preparePipeline=await device.createComputePipelineAsync({layout:"auto",compute:{module:cullModule,entryPoint:"prepare"}});
 });
 after(() => {
   device?.destroy();
@@ -64,7 +70,7 @@ function rotation(angles) {
   });
   return m;
 }
-async function run(model, axis, offset, angles) {
+async function run(model, axis, offset, angles, options={}) {
   const resources = [];
   const buffer = (size, usage) => {
     const b = device.createBuffer({ size, usage });
@@ -73,8 +79,11 @@ async function run(model, axis, offset, angles) {
   };
   try {
     const positions = model.positions(),
-      indices = model.gpu_cells(),
+      original = model.gpu_cells(),
       count = model.cell_count();
+    const bvh=buildBvh(positions,original);
+    const indices=new Uint32Array(original.length);
+    bvh.order.forEach((id,i)=>indices.set(original.subarray(id*8,id*8+8),i*8));
     const input = (data) => {
       const b = buffer(
         data.byteLength,
@@ -84,11 +93,11 @@ async function run(model, axis, offset, angles) {
       return b;
     };
     const output = buffer(
-      count * 192,
+      count * 384,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     );
     const counters = buffer(
-      20,
+      36,
       GPUBufferUsage.STORAGE |
         GPUBufferUsage.COPY_DST |
         GPUBufferUsage.COPY_SRC |
@@ -102,13 +111,17 @@ async function run(model, axis, offset, angles) {
     const f = new Float32Array(raw);
     f.set(rotation(angles));
     f.set(model.center(), 16);
-    f.set([offset, axis, model.radius() * 1e-6, model.radius()], 20);
+    f.set([options.mode ? (options.distance??3)*model.radius() : offset, axis, model.radius() * 1e-6, model.radius()], 20);
     const vertexNormals = model.vertex_normals();
-    const cellNormals = model.cell_normals();
+    const sourceNormals = model.cell_normals();
+    const cellNormals=new Float32Array(sourceNormals.length);
+    bvh.order.forEach((id,i)=>cellNormals.set(sourceNormals.subarray(id*4,id*4+4),i*4));
     const flags = Number(vertexNormals.length > 0) | (Number(cellNormals.length > 0) << 1);
-    new Uint32Array(raw).set([count, flags, 0, 0], 24);
+    new Uint32Array(raw).set([count, flags | (options.bvh?4:0), options.mode??0, bvh.roots], 24);
     device.queue.writeBuffer(uniform, 0, raw);
-    device.queue.writeBuffer(counters, 0, new Uint32Array([0, 1, 0, 0, 0]));
+    device.queue.writeBuffer(counters, 0, new Uint32Array([0, 1, 0, 0, 0, 0, 0, 1, 1]));
+    const dispatchArgs=buffer(12,GPUBufferUsage.STORAGE|GPUBufferUsage.INDIRECT);
+    const candidates=input(new Uint32Array(count));
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -120,27 +133,36 @@ async function run(model, axis, offset, angles) {
         input(vertexNormals.length ? vertexNormals : new Float32Array(4)),
         input(cellNormals.length ? cellNormals : new Float32Array(4)),
         input(Uint32Array.from({length: positions.length / 4}, (_,i) => i)),
+        candidates,
       ].map((b, binding) => ({ binding, resource: { buffer: b } })),
     });
     const read = buffer(
-      count * 192 + 32,
+      count * 384 + 64,
       GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     );
+    const started=performance.now();
     const encoder = device.createCommandEncoder();
+    if(options.bvh){
+      const cg=device.createBindGroup({layout:cullPipeline.getBindGroupLayout(0),entries:[input(bvh.nodes),candidates,counters,uniform].map((b,binding)=>({binding,resource:{buffer:b}}))});
+      const pg=device.createBindGroup({layout:preparePipeline.getBindGroupLayout(0),entries:[{binding:2,resource:{buffer:counters}},{binding:4,resource:{buffer:dispatchArgs}}]});
+      const cp=encoder.beginComputePass();cp.setPipeline(cullPipeline);cp.setBindGroup(0,cg);cp.dispatchWorkgroups(Math.ceil(bvh.roots/64));cp.end();
+      const pp=encoder.beginComputePass();pp.setPipeline(preparePipeline);pp.setBindGroup(0,pg);pp.dispatchWorkgroups(1);pp.end();
+    }
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, group);
-    pass.dispatchWorkgroups(Math.ceil(count / 64));
+    if(options.bvh)pass.dispatchWorkgroupsIndirect(dispatchArgs,0);
+    else pass.dispatchWorkgroups(Math.ceil(count / 64));
     pass.end();
-    encoder.copyBufferToBuffer(counters, 0, read, 0, 20);
-    encoder.copyBufferToBuffer(output, 0, read, 32, count * 192);
+    encoder.copyBufferToBuffer(counters, 0, read, 0, 36);
+    encoder.copyBufferToBuffer(output, 0, read, 64, count * 384);
     device.queue.submit([encoder.finish()]);
     await read.mapAsync(GPUMapMode.READ);
     const mapped = read.getMappedRange();
-    const values = new Uint32Array(mapped, 0, 5).slice();
-    const vertices = new Float32Array(mapped, 32, values[0] * 8).slice();
+    const values = new Uint32Array(mapped, 0, 9).slice();
+    const vertices = new Float32Array(mapped, 64, values[0] * 8).slice();
     read.unmap();
-    return { values, vertices };
+    return { values, vertices, elapsed:performance.now()-started };
   } finally {
     resources.forEach((x) => x.destroy());
   }
@@ -358,7 +380,7 @@ test("batched renderer preserves the section, depth and statistics", async () =>
   const mesh = { positions: model.positions(), indices: model.gpu_cells(),
     vertexNormals: model.vertex_normals(), cellNormals: model.cell_normals(),
     center: model.center(), radius: model.radius() };
-  async function draw(limit, offset, smooth) {
+  async function draw(limit, offset, smooth, mode=0, acceleration=true) {
     const color = device.createTexture({ size: [64, 64], format: "rgba8unorm",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const proxy = new Proxy(device, { get(target, key) {
@@ -370,7 +392,7 @@ test("batched renderer preserves the section, depth and statistics", async () =>
       return typeof value === "function" ? value.bind(target) : value;
     }});
     const renderer = new Renderer({ clientWidth: 64, clientHeight: 64, width: 0, height: 0 },
-      proxy, { getCurrentTexture: () => color, unconfigure() {} }, pipeline, renderPipeline);
+      proxy, { getCurrentTexture: () => color, unconfigure() {} }, pipeline, renderPipeline, cullPipeline, preparePipeline);
     const read = device.createBuffer({ size: 64 * 256,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     try {
@@ -378,7 +400,7 @@ test("batched renderer preserves the section, depth and statistics", async () =>
       const stats = await new Promise((resolve, reject) => {
         renderer.onStats = resolve; renderer.onError = reject;
         renderer.draw({ axis: 3, offset, angles: [0,0,0,0,0,0],
-          yaw: 0.55, pitch: -0.32, distance: 2.8, style: 1, smooth });
+          yaw: 0.55, pitch: -0.32, distance: 2.8, style: 1, smooth, mode, acceleration });
       });
       const encoder = device.createCommandEncoder();
       encoder.copyTextureToBuffer({ texture: color }, { buffer: read, bytesPerRow: 256 }, [64,64]);
@@ -390,9 +412,9 @@ test("batched renderer preserves the section, depth and statistics", async () =>
     } finally { renderer.destroy(); read.destroy(); color.destroy(); }
   }
   try {
-    for (const offset of [0, 1]) for (const smooth of [false,true]) {
-      const whole = await draw(1 << 20, offset, smooth);
-      const batches = await draw(1536, offset, smooth); // 8 cells per batch, crossing shared faces
+    for(const mode of [0,1,2]) for (const offset of [0, 1]) for (const smooth of [false,true]) {
+      const whole = await draw(1 << 20, offset, smooth, mode, false);
+      const batches = await draw(1536, offset, smooth, mode, true); // 8 cells per batch, crossing shared faces
       assert.equal(batches.stats.triangles, whole.stats.triangles);
       assert.equal(batches.stats.coplanar, whole.stats.coplanar);
       assert.deepEqual(batches.pixels, whole.pixels);
@@ -590,4 +612,77 @@ test("a busy GPU accepts only the newest pending camera and section state",async
     gates.shift()();await new Promise(resolve=>setImmediate(resolve));
     assert.equal(submissions,2,"stats readback must not enqueue an extra draw");
   }finally{renderer.destroy();color.destroy();model.free();for(const resolve of gates)resolve();}
+});
+
+function canonicalTriangles(data) {
+ const rows=[];
+ for(let i=0;i<data.length;i+=24)rows.push([0,8,16].map(j=>[0,1,2].map(k=>data[i+j+k].toFixed(5)).join(',')).sort().join(';'));
+ return rows.sort();
+}
+test('GPU BVH matches full scan for rotations, boundary and empty cuts',async()=>{
+ for(let kind=0;kind<3;kind++){
+  const model=ViewerModel.sample(kind);
+  try{for(let axis=0;axis<4;axis++)for(const angles of [[0,0,0,0,0,0],[.11,-.32,.27,.19,.41,-.13]])for(const offset of [0,model.radius(),.173,model.radius()*2]){
+   const full=await run(model,axis,offset,angles);
+   const culled=await run(model,axis,offset,angles,{bvh:true});
+   assert.equal(culled.values[0],full.values[0]);assert.equal(culled.values[4],full.values[4]);
+   assert.deepEqual(canonicalTriangles(culled.vertices),canonicalTriangles(full.vertices));
+   assert.ok(culled.values[5]<=model.cell_count());
+  }}finally{model.free();}
+ }
+});
+test('GPU BVH reduces sparse 8192-cell mesh to a conservative candidate subset',async(t)=>{
+ const count=8192, bytes=new Uint8Array(12+count*80),view=new DataView(bytes.buffer);
+ [1,count*4,count].forEach((x,i)=>view.setUint32(i*4,x,true));
+ let at=12;
+ for(let i=0;i<count;i++)for(const p of [[0,0,0,-.4],[1,0,0,.4],[0,1,0,.4],[0,0,1,.4]])for(let axis=0;axis<4;axis++){
+  view.setFloat32(at,p[axis]+(axis===3?(i-count/2)*2:0),true);at+=4;
+ }
+ for(let i=0;i<count*4;i++){view.setUint32(at,i+1,true);at+=4;}
+ const model=new ViewerModel(bytes,true);
+ try{
+  const offset=-model.center()[3];
+  const full=await run(model,3,offset,[0,0,0,0,0,0]);
+  const culled=await run(model,3,offset,[0,0,0,0,0,0],{bvh:true});
+  assert.ok(full.values[0]>0);assert.deepEqual(canonicalTriangles(culled.vertices),canonicalTriangles(full.vertices));
+  assert.ok(culled.values[5]<count/20);
+  t.diagnostic(`sparse mesh: ${culled.values[5]}/${count} candidate cells; geometry matches full scan`);
+  for(const axis of [3,0]){
+   const fullTimes=[],bvhTimes=[];
+   for(let repeat=0;repeat<7;repeat++){
+    const a=await run(model,axis,axis===3?offset:0,[0,0,0,0,0,0]);
+    const b=await run(model,axis,axis===3?offset:0,[0,0,0,0,0,0],{bvh:true});
+    assert.equal(a.values[0],b.values[0]);fullTimes.push(a.elapsed);bvhTimes.push(b.elapsed);
+   }
+   const median=a=>a.sort((x,y)=>x-y)[3].toFixed(3);
+   t.diagnostic(`lavapipe compute+copy+readback median (7 runs), axis=${axis}: full ${median(fullTimes)} ms, BVH ${median(bvhTimes)} ms; CPU build/upload excluded`);
+  }
+ }finally{model.free();}
+});
+test('parallel and perspective projection match unique-face CPU reference',async()=>{
+ for(let kind=0;kind<3;kind++){
+  const model=ViewerModel.sample(kind);
+  try{for(let axis=0;axis<4;axis++)for(const mode of [1,2]){
+   const angles=[.11,-.32,.27,.19,.41,-.13],matrix=rotation(angles),center=model.center(),radius=model.radius();
+   const positions=model.positions(),cells=model.gpu_cells(),expected=[];
+   for(let id=0;id<model.cell_count();id++){
+    const points=[];
+    for(let corner=0;corner<4;corner++){
+     const p=rotatePoint(matrix,Array.from(positions.subarray(cells[id*8+corner]*4,cells[id*8+corner]*4+4), (v,j)=>v-center[j]));
+     points.push(p.filter((_,j)=>j!==axis).map(v=>v/radius*(mode===2?3*radius/(3*radius-p[axis]):1)));
+    }
+    for(let omitted=0;omitted<4;omitted++)if(cells[id*8+4]&(1<<omitted)){
+     const face=points.filter((_,j)=>j!==omitted);const a=face[1].map((v,j)=>v-face[0][j]),b=face[2].map((v,j)=>v-face[0][j]);
+     if(Math.hypot(a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0])<=1e-12)continue;
+     face.forEach(p=>expected.push(...p,1,0,0,1,0));
+    }
+   }
+   const result=await run(model,axis,999,angles,{mode});
+   assert.equal(result.values[0],expected.length/8);
+   assert.ok(Math.abs(area(result.vertices,8)-area(expected,8))<1e-4);
+   // Every projected vertex must agree with the CPU formula, independent of atomic output order.
+   for(let i=0;i<result.vertices.length;i+=8)assert.ok(expected.some((_,j)=>j%8===0&&Math.hypot(...[0,1,2].map(k=>expected[j+k]-result.vertices[i+k]))<2e-6));
+   assert.ok(result.vertices.every(Number.isFinite));
+  }}finally{model.free();}
+ }
 });
