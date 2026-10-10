@@ -1,7 +1,8 @@
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Renderer, type Scene, type Stats } from "../src/gpu";
 import { loadCore, type Model } from "../src/model";
+import { createFrameScheduler } from "../src/frame";
 const INITIAL: Scene = {
   axis: 3,
   offset: 0,
@@ -21,9 +22,7 @@ export default function Page() {
     input = useRef<HTMLInputElement>(null);
   const sceneRef = useRef<Scene>(INITIAL),
     radiusRef = useRef(1),
-    durationRef = useRef(30),
-    frame = useRef(0),
-    pendingCompute = useRef(false);
+    durationRef = useRef(30);
   const [scene, setScene] = useState<Scene>(INITIAL),
     [ready, setReady] = useState(false),
     [error, setError] = useState(""),
@@ -39,17 +38,15 @@ export default function Page() {
     [playing, setPlaying] = useState(false),
     [duration, setDuration] = useState(30),
     [busy, setBusy] = useState(false);
+  const redraw = useMemo(() => createFrameScheduler((compute) => {
+    renderer.current?.draw(sceneRef.current, compute);
+  }), []);
   const change = useCallback((patch: Partial<Scene>, compute = true) => {
     const next = { ...sceneRef.current, ...patch };
     sceneRef.current = next;
     setScene(next);
-    pendingCompute.current ||= compute;
-    cancelAnimationFrame(frame.current);
-    frame.current = requestAnimationFrame(() => {
-      renderer.current?.draw(next, pendingCompute.current);
-      pendingCompute.current = false;
-    });
-  }, []);
+    redraw.schedule(compute);
+  }, [redraw]);
   const install = useCallback(
     (next: Model, title: string) => {
       try {
@@ -102,13 +99,13 @@ export default function Page() {
     })();
     return () => {
       cancelled = true;
-      cancelAnimationFrame(frame.current);
+      redraw.cancel();
       renderer.current?.destroy();
       renderer.current = null;
       model.current?.free();
       model.current = null;
     };
-  }, [install]);
+  }, [install, redraw]);
   useEffect(() => {
     if (!playing) return;
     let id = 0,

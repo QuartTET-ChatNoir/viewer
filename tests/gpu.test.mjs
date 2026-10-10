@@ -508,3 +508,86 @@ test("GPU quad uses Delaunay and a stable square diagonal across every cell orde
     }
   }
 });
+
+test("animation and pointer updates share a pending frame and draw the latest scene", async () => {
+  const {createFrameScheduler}=await import("../src/frame.ts");
+  const frames=new Map();let id=0,cancelled=0,scene={offset:0,yaw:0},result;
+  const scheduler=createFrameScheduler(compute=>{result={...scene,compute};},
+    cb=>{frames.set(++id,cb);return id;}, key=>{cancelled++;frames.delete(key);});
+  scene={...scene,offset:0.1};scheduler.schedule(true);
+  scene={...scene,yaw:0.7};scheduler.schedule(false);
+  scene={...scene,offset:0.2};scheduler.schedule(true);
+  assert.equal(frames.size,1);assert.equal(cancelled,0);
+  [...frames.values()][0](16);
+  assert.deepEqual(result,{offset:0.2,yaw:0.7,compute:true});
+});
+test("camera events during an animation frame cannot starve an already scheduled draw",async()=>{
+  const {createFrameScheduler}=await import("../src/frame.ts");
+  let queue=[],nextId=0,draws=0;
+  const request=cb=>{const id=++nextId;queue.push({id,cb});return id;};
+  const scheduler=createFrameScheduler(()=>{draws++;},request,id=>{queue=queue.filter(x=>x.id!==id);});
+  function tick(time){scheduler.schedule(true);request(tick);}
+  request(tick);scheduler.schedule(false); // animation callback precedes pending camera draw
+  for(let frame=1;frame<=10;frame++){
+    const ready=queue;queue=[];
+    for(const {cb} of ready)cb(frame*16);
+    scheduler.schedule(false); // pointer move before the next refresh
+  }
+  assert.equal(draws,10);
+});
+test("frame cleanup cancels pending work and resets the compute flag",async()=>{
+  const {createFrameScheduler}=await import("../src/frame.ts");
+  const frames=new Map();let id=0,result;
+  const scheduler=createFrameScheduler(compute=>{result=compute;},
+    cb=>{frames.set(++id,cb);return id;},id=>{frames.delete(id);});
+  scheduler.schedule(true);scheduler.cancel();assert.equal(frames.size,0);
+  scheduler.schedule(false);[...frames.values()][0](16);assert.equal(result,false);
+});
+
+test("a busy GPU accepts only the newest pending camera and section state",async()=>{
+  const {Renderer}=await import("../src/gpu.ts");
+  globalThis.ResizeObserver=class{observe(){}disconnect(){}};
+  globalThis.devicePixelRatio=1;
+  const module=device.createShaderModule({code:await readFile(new URL("../public/shaders/render.wgsl",import.meta.url),"utf8")});
+  const render=await device.createRenderPipelineAsync({layout:"auto",
+    vertex:{module,entryPoint:"vs"},fragment:{module,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},
+    primitive:{topology:"triangle-list",cullMode:"none"},
+    depthStencil:{format:"depth24plus",depthWriteEnabled:true,depthCompare:"less"}});
+  const gates=[];let submissions=0,camera,params;
+  const queue=new Proxy(device.queue,{get(target,key){
+    if(key==="onSubmittedWorkDone")return()=>new Promise(resolve=>gates.push(resolve));
+    if(key==="submit")return(commands)=>{submissions++;target.submit(commands);};
+    if(key==="writeBuffer")return(...args)=>{
+      const [buffer,,bytes]=args;
+      if(buffer.size===32)camera=Array.from(new Float32Array(bytes.buffer,bytes.byteOffset,8));
+      if(buffer.size===112)params=Array.from(new Float32Array(bytes));
+      target.writeBuffer(...args);
+    };
+    const value=Reflect.get(target,key,target);return typeof value==="function"?value.bind(target):value;
+  }});
+  const proxy=new Proxy(device,{get(target,key){
+    if(key==="queue")return queue;if(key==="destroy")return()=>{};
+    const value=Reflect.get(target,key,target);return typeof value==="function"?value.bind(target):value;
+  }});
+  const color=device.createTexture({size:[64,64],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT});
+  const renderer=new Renderer({clientWidth:64,clientHeight:64,width:0,height:0},proxy,
+    {getCurrentTexture:()=>color,unconfigure(){}},pipeline,render);
+  const model=ViewerModel.sample(0);
+  try{
+    renderer.load({positions:model.positions(),indices:model.gpu_cells(),center:model.center(),radius:model.radius(),
+      vertexNormals:model.vertex_normals(),cellNormals:model.cell_normals()});
+    const initial={axis:3,offset:0,angles:[0,0,0,0,0,0],yaw:0,pitch:0,distance:2.8,style:1,smooth:false};
+    renderer.draw(initial);
+    renderer.draw({...initial,yaw:1,offset:0.1});
+    renderer.draw({...initial,yaw:2,offset:0.2});
+    assert.equal(submissions,1);
+    await device.queue.onSubmittedWorkDone();
+    gates.shift()();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(submissions,2);
+    assert.equal(camera[1],2);
+    assert.ok(Math.abs(params[20]-0.2)<1e-6);
+    await device.queue.onSubmittedWorkDone();
+    gates.shift()();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(submissions,2,"stats readback must not enqueue an extra draw");
+  }finally{renderer.destroy();color.destroy();model.free();for(const resolve of gates)resolve();}
+});

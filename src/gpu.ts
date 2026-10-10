@@ -59,7 +59,8 @@ export class Renderer {
   private camera: GPUBuffer;
   private observer: ResizeObserver;
   private scene?: Scene;
-  private needStats = false;
+  private drawing = false;
+  private pendingDraw = false;
   onStats?: (stats: Stats) => void;
   onError?: (error: string) => void;
   private canvas: HTMLCanvasElement;
@@ -249,6 +250,18 @@ export class Renderer {
   draw(scene: Scene, _recompute = true): void {
     if (this.destroyed || !this.batches.length || !this.renderGroup) return;
     this.scene = scene;
+    if (this.drawing) { this.pendingDraw = true; return; }
+    this.drawing = true;
+    this.pendingDraw = false;
+    try { this.submit(scene); }
+    catch (error) {
+      this.drawing = false;
+      this.onError?.(String(error));
+    }
+  }
+  private submit(scene: Scene): void {
+    if (this.destroyed || !this.batches.length || !this.renderGroup) return;
+    this.scene = scene;
     const width = Math.max(
       1,
       Math.min(
@@ -295,11 +308,10 @@ export class Renderer {
     const started = performance.now();
     // Output storage is reused between batches. Compute and draw remain on GPU;
     // camera-only changes recompute as well because earlier batches are not cached.
-    this.needStats = true;
     const read = !this.reading;
     const readback = this.readback;
     const generation = this.generation;
-    if (read) { this.needStats = false; this.reading = true; }
+    if (read) this.reading = true;
     const view = this.context.getCurrentTexture().createView();
     this.batches.forEach((batch, index) => {
       const bytes = new ArrayBuffer(112);
@@ -330,6 +342,13 @@ export class Renderer {
       if (read) encoder.copyBufferToBuffer(batch.counters, 0, readback, index * 20, 20);
     });
     this.device.queue.submit([encoder.finish()]);
+    void this.device.queue.onSubmittedWorkDone()
+      .catch((error) => { if (!this.destroyed) this.onError?.(String(error)); })
+      .finally(() => {
+        this.drawing = false;
+        if (this.pendingDraw && this.scene && !this.destroyed)
+          this.draw(this.scene);
+      });
     if (read) {
       void readback
         .mapAsync(GPUMapMode.READ)
@@ -353,8 +372,6 @@ export class Renderer {
         })
         .finally(() => {
           this.reading = false;
-          if (this.needStats && this.scene && !this.destroyed)
-            this.draw(this.scene, false);
         });
     }
   }
